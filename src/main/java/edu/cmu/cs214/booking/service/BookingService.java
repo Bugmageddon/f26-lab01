@@ -6,7 +6,9 @@ import edu.cmu.cs214.booking.domain.TimeInterval;
 import edu.cmu.cs214.booking.domain.User;
 import edu.cmu.cs214.booking.domain.WaitlistEntry;
 import edu.cmu.cs214.booking.repo.BookingStore;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Coordinates bookings and the waitlist. Enforces the core invariant: a room
@@ -42,8 +44,61 @@ public class BookingService {
         return new BookingResult.Confirmed(booking);
     }
 
+    /**
+     * Reports whether {@code room} is free over {@code interval}, so callers can
+     * check availability before attempting to book.
+     */
+    public boolean isAvailable(Room room, TimeInterval interval) {
+        for (Booking b : store.bookingsForRoom(room)) {
+            if (b.interval().overlaps(interval)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** Returns the confirmed bookings for {@code room}. */
     public List<Booking> listBookings(Room room) {
         return store.bookingsForRoom(room);
+    }
+
+    /**
+     * Cancels the confirmed booking with id {@code bookingId}, freeing its slot.
+     * If no booking has that id, does nothing. After removal, promotes at most
+     * one waitlisted user for the same room whose requested interval no longer
+     * conflicts with any remaining confirmed booking (first-come-first-served
+     * by {@code seq}). Waiters whose interval still conflicts are skipped.
+     */
+    public void cancelBooking(String bookingId) {
+        Optional<Booking> found = store.findBooking(bookingId);
+        if (found.isEmpty()) {
+            return;
+        }
+        Booking cancelled = found.get();
+        Room room = cancelled.room();
+        store.removeBooking(bookingId);
+
+        List<Booking> remaining = store.bookingsForRoom(room);
+        List<WaitlistEntry> waitlist = store.waitlistForRoom(room);
+        List<WaitlistEntry> sorted = waitlist.stream()
+                .sorted(Comparator.comparingInt(WaitlistEntry::seq))
+                .toList();
+
+        for (WaitlistEntry waiter : sorted) {
+            boolean conflicts = false;
+            for (Booking b : remaining) {
+                if (b.interval().overlaps(waiter.interval())) {
+                    conflicts = true;
+                    break;
+                }
+            }
+            if (!conflicts) {
+                Booking promoted = new Booking("b" + nextBookingSeq++, room,
+                        waiter.user(), waiter.interval());
+                store.addBooking(promoted);
+                store.removeWaitlistEntry(waiter.id());
+                break;
+            }
+        }
     }
 }
