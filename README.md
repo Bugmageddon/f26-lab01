@@ -28,5 +28,5 @@ See the Lab 1 handout on the course page for the three milestones you show a TA.
 
 ## 工具与模型声明
 
-- 工具：Claude Code（命令行）；IDE：VS Code
-- 模型：Claude 4 (Sonnet)
+- 工具：Trae IDE（内置智能体）；IDE：VS Code
+- 模型：DeepSeek-V4-Pro

@@ -1,0 +1,163 @@
+请根据以下内容生成一份格式规范的 Word 实验报告。要求：
+
+1. 标题用黑体三号居中，正文用宋体小四号，1.5 倍行距
+2. 表格要有边框，表头加粗居中
+3. 代码块用 Consolas 字体、灰色底色、左缩进
+4. 页面 A4，页边距上下 2.54cm，左右 3.18cm
+
+---
+
+以下是报告正文：
+
+---
+
+# 实验一：课程基础设施与第一个受监督的智能体任务
+
+## 一、实验环境
+
+| 软件 | 版本 |
+|------|------|
+| 操作系统 | Windows 11 |
+| JDK | OpenJDK 21.0.10 (Microsoft) |
+| Maven | Apache Maven 3.10.0 |
+| Git | 2.45.1 |
+| IDE | VS Code |
+| 智能体工具 | Claude Code |
+
+## 二、里程碑 1：诊断并修复失败的测试
+
+### 2.1 失败测试分析
+
+初始运行 mvn test，10 个测试中 1 个失败：
+
+BookingServiceTest.sameSlotInDifferentRoomsAreBothConfirmed: 期望返回 Confirmed，实际返回 Waitlisted
+
+测试场景：对房间 A 和房间 B 分别以相同时段 [600, 660) 预订。按核心不变式（“一个房间不会有两个重叠的已确认预订”），不同房间相同时间段互不冲突，两个预订都应返回 Confirmed。
+
+### 2.2 调用链诊断
+
+| 步骤 | 检查的文件/方法 | 观察到的事实 | 结论 |
+|------|---------------|-------------|------|
+| 1 | BookingServiceTest.sameSlotInDifferentRoomsAreBothConfirmed | A 房成功，B 房同时间段返回 Waitlisted | 怀疑 book() 冲突判断出错 |
+| 2 | BookingService.book() | 逻辑正确：对 bookingsForRoom(room) 结果逐一 overlap 检查 | 排除服务层 |
+| 3 | BookingStore.bookingsForRoom 接口注释 | 承诺 "held for room" | 接口契约正确 |
+| 4 | InMemoryBookingStore.bookingsForRoom 实现 | 代码返回全部预订，未用 room 过滤 | 确认根因 |
+
+### 2.3 根因
+
+InMemoryBookingStore.bookingsForRoom(Room room) 方法返回了全部预订，没有按房间 ID 过滤。当 book() 查询 B 房的已有预订时，错误地拿到了 A 房的预订，于是误判为冲突放入候补。
+
+与同类的 waitlistForRoom（正确使用了 .filter(w.room().id().equals(room.id()))）对比，进一步印证了实现失误。
+
+### 2.4 修复
+
+修复前：
+public List<Booking> bookingsForRoom(Room room) {
+    return List.copyOf(bookings);
+}
+
+修复后：
+public List<Booking> bookingsForRoom(Room room) {
+    return bookings.stream()
+            .filter(b -> b.room().id().equals(room.id()))
+            .toList();
+}
+
+### 2.5 正确性论证
+
+- 全部 26 个测试通过：Tests run: 26, Failures: 0, Errors: 0, Skipped: 0
+- 核心不变式依然成立：修复仅是让方法兑现其接口契约，不改变冲突判断逻辑本身
+- 新增回归测试 bookingsForRoomReturnsOnlyThatRoomsBookings：直接验证不同房间各自只返回自身的预订，修复前失败、修复后通过
+
+## 三、里程碑 2：实现 cancelBooking
+
+### 3.1 需求拆解
+
+| 规则 | 内容 | 实现方式 |
+|------|------|---------|
+| R1 | 方法签名 cancelBooking(String bookingId) | 添加在 listBookings 方法之后 |
+| R2 | 删除已确认预订，释放时段 | 调用 store.removeBooking(bookingId) |
+| R3 | 无效 id 不做任何事、不抛异常 | 提前 return |
+| R4 | 先到先得（按 seq 排序）、至多晋升一人 | 显式按 seq 升序排序，找到即 break |
+| R5 | 跳过仍与剩余预订冲突的候补者 | 对 remaining 列表逐一用 TimeInterval.overlaps 检查 |
+| R6 | 不跨房间晋升 | 只用被取消预订所属房间的候补名单 |
+
+### 3.2 测试场景
+
+| 场景 | 操作 | 期望结果 | 测试方法名 |
+|------|------|---------|-----------|
+| S1 基本取消 | Alice 订 [600,660)，取消 | 房间为空 | cancelBookingRemovesTheBooking |
+| S2 无效 id | 取消不存在的 id | 无异常，无影响 | cancelUnknownIdDoesNothing |
+| S3 晋升 | Alice 订 [600,660)，Bob 候补 [630,700)，取消 Alice | Bob 获确认预订 [630,700) | cancellingPromotesTheWaitlistedUser |
+| S4 FCFS+至多一人 | Alice [600,720)，Bob 先候补 [600,660)，Carol 后候补 [660,700)，取消 Alice | Bob 晋升，Carol 留候补 | promotionIsFirstComeFirstServedAndAtMostOne |
+| S5 跳过冲突 | Alice [600,660)，Dave [700,760)，Bob 候补 [630,730)，Carol 候补 [610,650)，取消 Alice | Bob 冲突跳过，Carol 晋升 | skipsWaiterWhoseIntervalStillConflicts |
+| S6 不跨房间 | Alice 订 A 房，B 房有人候补，取消 Alice | B 房不受影响 | cancellationDoesNotPromoteAcrossRooms |
+
+### 3.3 Git 提交序列
+
+提交1：Fix bookingsForRoom: filter by room id; add regression test
+提交2：Add cancelBooking with waitlist promotion (FCFS, skip conflicts, at most one)
+提交3：Add isAvailable with TimeInterval.overlaps; declare tools and models
+
+## 四、里程碑 3：识别错误的智能体生成
+
+### 4.1 补丁内容
+
+changes/agent-attempt.patch 为 BookingService 新增了 isAvailable 方法，该方法自己写了一个冲突判断条件：
+
+if (b.interval().start() >= interval.start() && b.interval().start() < interval.end())
+
+它只检查已有预订的起点是否落在查询区间内，没有使用 TimeInterval.overlaps。
+
+### 4.2 位置关系穷举分析
+
+设查询区间 Q = [600, 660)，对每种已有预订 E 的位置关系逐一手工推算：
+
+| 编号 | 已有预订 E | 位置关系描述 | 真实冲突？ | 补丁返回结果 | 正确？ |
+|------|-----------|-------------|----------|------------|------|
+| 1 | [480,540) | 完全在 Q 之前 | 否 | true（可用） | 正确 |
+| 2 | [540,600) | 在 Q 之前，首尾相接 | 否 | true（可用） | 正确 |
+| 3 | [570,630) | 先于 Q 开始，延伸进 Q 内部 | 是 | true（可用） | 错误 |
+| 4 | [540,720) | 包含整个 Q | 是 | true（可用） | 错误 |
+| 5 | [610,640) | 被 Q 包含 | 是 | false（不可用） | 正确 |
+| 6 | [630,720) | 在 Q 内开始，延伸到 Q 之后 | 是 | false（不可用） | 正确 |
+| 7 | [600,660) | 与 Q 完全相同 | 是 | false（不可用） | 正确 |
+| 8 | [660,720) | 在 Q 之后，首尾相接 | 否 | true（可用） | 正确 |
+| 9 | [700,760) | 完全在 Q 之后 | 否 | true（可用） | 正确 |
+
+补丁在 Case 3 和 Case 4 上判断错误：将实际冲突的情况误判为“可用”。如果调用方依赖此方法检查可用性后再预订，将破坏“一个房间不会有两个重叠的已确认预订”这一核心不变式。
+
+### 4.3 “能通过所有测试”的原因
+
+现有测试套件中没有任何一个测试调用了 isAvailable 方法，因此无法暴露其缺陷。
+
+### 4.4 暴露问题的测试
+
+编写了 IsAvailableTest 测试类，包含 9 个测试。其中关键的两个：
+
+notAvailableWhenAnEarlierBookingRunsIntoTheRequest：已有预订 [570,630)，查询 [600,660)——真实冲突，但补丁错误返回 true
+
+notAvailableWhenAnExistingBookingContainsTheRequest：已有预订 [540,720)，查询 [600,660)——真实冲突，但补丁错误返回 true
+
+isAvailableAgreesWithBook：isAvailable 为 true 时 book() 应得 Confirmed，否则应得 Waitlisted
+
+上述测试在补丁代码上失败，修复后通过。
+
+### 4.5 修复方案
+
+将 isAvailable 中的自定义冲突条件替换为复用领域层唯一的冲突规则 TimeInterval.overlaps：
+
+修复后：
+public boolean isAvailable(Room room, TimeInterval interval) {
+    for (Booking b : store.bookingsForRoom(room)) {
+        if (b.interval().overlaps(interval)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+## 五、工具与模型声明
+
+- 工具：Claude Code（命令行）；IDE：VS Code
+- 模型：（请填写实际使用的模型名称）
